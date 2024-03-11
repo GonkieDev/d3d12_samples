@@ -31,7 +31,7 @@ main :: proc() {
 	}
 	defer sdl.DestroyWindow(window)
 
-	triangle.init(window)
+	if !triangle.init(window) do return
 	defer triangle.deinit()
 
 	main_loop: for {
