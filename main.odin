@@ -1,5 +1,7 @@
 package main
 
+// Building: add SDL2.dll to wherever you put the final exe
+
 import "core:log"
 import dxgi "vendor:directx/dxgi"
 import sdl "vendor:sdl2"
