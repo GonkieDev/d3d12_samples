@@ -310,10 +310,10 @@ init :: proc(window: ^sdl.Window) -> bool {
 		dx.ICommandList_UUID,
 		(^rawptr)(&state.command_list),
 	)
-	check(hr, "Failed to create command list")
+	check(hr, "Failed to create command list") or_return
 
 	hr = state.command_list->Close()
-	check(hr, "Failed to close command list")
+	check(hr, "Failed to close command list") or_return
 
 	// Vertex buffer
 	{
@@ -355,12 +355,12 @@ init :: proc(window: ^sdl.Window) -> bool {
 			dx.IResource_UUID,
 			(^rawptr)(&state.vertex_buffer),
 		)
-		check(hr, "Failed to create vertex buffer")
+		check(hr, "Failed to create vertex buffer") or_return
 
 		gpu_data: rawptr
 		read_range: dx.RANGE
 		hr = state.vertex_buffer->Map(0, &read_range, &gpu_data)
-		check(hr, "Failed to map gpu memory for vertex buffer")
+		check(hr, "Failed to map gpu memory for vertex buffer") or_return
 		mem.copy(gpu_data, &vertices[0], vertex_buffer_size)
 		state.vertex_buffer->Unmap(0, nil)
 
@@ -381,7 +381,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 			dx.IFence_UUID,
 			(^rawptr)(&state.frame_finished_fence),
 		)
-		check(hr, "Failed to create frame finished fence")
+		check(hr, "Failed to create frame finished fence") or_return
 		state.frame_finished_fence_value += 1
 		state.frame_finished_fence_event = win32.CreateEventW(nil, false, false, nil)
 		if state.frame_finished_fence_event == nil {
@@ -395,6 +395,15 @@ init :: proc(window: ^sdl.Window) -> bool {
 
 deinit :: proc() {
 	log.info("Triangle deinit")
+	
+	using state
+
+
+	wait_for_previous_frame()
+	win32.CloseHandle(frame_finished_fence_event)
+	
+	// TODO(gsp): finish this func
+	
 	free(state)
 }
 
@@ -477,43 +486,33 @@ update :: proc(window: ^sdl.Window) -> bool {
 	hr = swapchain->Present1(1, {}, &{})
 	check(hr, "Failed to present") or_return
 
-	// Wait for frame to finish
-	{
-		current_fence_value := frame_finished_fence_value
-		hr = queue->Signal(frame_finished_fence, current_fence_value)
-		check(hr, "Failed to signal fence")
-
-		frame_finished_fence_value += 1
-		completed := frame_finished_fence->GetCompletedValue()
-
-		if completed < current_fence_value {
-			hr = frame_finished_fence->SetEventOnCompletion(current_fence_value, frame_finished_fence_event)
-			check(hr, "Failed to set event on completion flag")
-			win32.WaitForSingleObject(frame_finished_fence_event, win32.INFINITE)
-		}
-
-		frame_index = swapchain->GetCurrentBackBufferIndex()
-	}
+	wait_for_previous_frame() or_return
 
 	return true
 }
 
-check :: proc(res: dx.HRESULT, message: string) -> bool {
-	if (res >= 0) do return true
-	log.errorf("%v. Error code: %0x\n", message, u32(res))
-	return false
-}
+wait_for_previous_frame :: proc() -> bool {
+	// WAITING FOR THE FRAME TO COMPLETE BEFORE CONTINUING IS NOT BEST PRACTICE.
 
-hwnd_from_window :: proc(window: ^sdl.Window) -> dxgi.HWND {
-	wm_info: sdl.SysWMinfo
-	sdl.GetWindowWMInfo(window, &wm_info)
-	return dxgi.HWND(wm_info.info.win.window)
-}
+	using state
 
-client_size_from_window :: proc(window: ^sdl.Window) -> [2]i32 {
-	res: [2]i32
-	sdl.GetWindowSize(window, &res[0], &res[1])
-	return res
+	hr: dx.HRESULT
+	
+	current_fence_value := frame_finished_fence_value
+	hr = queue->Signal(frame_finished_fence, current_fence_value)
+	check(hr, "Failed to signal fence") or_return
+
+	frame_finished_fence_value += 1
+	completed := frame_finished_fence->GetCompletedValue()
+
+	if completed < current_fence_value {
+		hr = frame_finished_fence->SetEventOnCompletion(current_fence_value, frame_finished_fence_event)
+		check(hr, "Failed to set event on completion flag") or_return
+		win32.WaitForSingleObject(frame_finished_fence_event, win32.INFINITE)
+	}
+
+	frame_index = swapchain->GetCurrentBackBufferIndex()
+	return true
 }
 
 // Shader source code
@@ -535,3 +534,22 @@ float4 PSMain(PSInput input) : SV_TARGET {
 };
 `
 
+// Util check
+check :: proc(res: dx.HRESULT, message: string) -> bool {
+	if (res >= 0) do return true
+	log.errorf("%v. Error code: %0x\n", message, u32(res))
+	return false
+}
+
+// Window stuff
+hwnd_from_window :: proc(window: ^sdl.Window) -> dxgi.HWND {
+	wm_info: sdl.SysWMinfo
+	sdl.GetWindowWMInfo(window, &wm_info)
+	return dxgi.HWND(wm_info.info.win.window)
+}
+
+client_size_from_window :: proc(window: ^sdl.Window) -> [2]i32 {
+	res: [2]i32
+	sdl.GetWindowSize(window, &res[0], &res[1])
+	return res
+}
