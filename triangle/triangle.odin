@@ -3,22 +3,34 @@ package triangle
 // Credits to: https://gist.github.com/jakubtomsu/ecd83e61976d974c7730f9d7ad3e1fd0
 
 import "core:log"
+import "core:mem"
 import dx "vendor:directx/d3d12"
+import d3d_compiler "vendor:directx/d3d_compiler"
 import dxgi "vendor:directx/dxgi"
 import sdl "vendor:sdl2"
+import win32 "core:sys/windows"
 
+@(private)
 NUM_RENDERTARGETS :: 2
 
 State :: struct {
-	debug_ctrl:          ^dx.IDebug,
-	factory:             ^dxgi.IFactory4,
-	adapter:             ^dxgi.IAdapter1,
-	device:              ^dx.IDevice,
-	queue:               ^dx.ICommandQueue,
-	swapchain:           ^dxgi.ISwapChain3,
-	rtv_descriptor_heap: ^dx.IDescriptorHeap,
-	frame_index:         u32,
-	render_targets:      [NUM_RENDERTARGETS]^dx.IResource,
+	debug_ctrl:                 ^dx.IDebug,
+	factory:                    ^dxgi.IFactory4,
+	adapter:                    ^dxgi.IAdapter1,
+	device:                     ^dx.IDevice,
+	queue:                      ^dx.ICommandQueue,
+	swapchain:                  ^dxgi.ISwapChain3,
+	rtv_descriptor_heap:        ^dx.IDescriptorHeap,
+	frame_index:                u32,
+	render_targets:             [NUM_RENDERTARGETS]^dx.IResource,
+	command_allocator:          ^dx.ICommandAllocator,
+	root_signature:             ^dx.IRootSignature,
+	pipeline:                   ^dx.IPipelineState,
+	command_list:               ^dx.IGraphicsCommandList,
+	vertex_buffer:              ^dx.IResource,
+	vertex_buffer_view:         dx.VERTEX_BUFFER_VIEW,
+	frame_finished_fence:       ^dx.IFence,
+	frame_finished_fence_value: u64,
 }
 
 @(private)
@@ -111,7 +123,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 	{
 		desc := dx.DESCRIPTOR_HEAP_DESC {
 			NumDescriptors = NUM_RENDERTARGETS,
-			Type           = .RTV,
+			Type           = .RTV, // render target view
 			Flags          = {},
 		}
 
@@ -121,10 +133,251 @@ init :: proc(window: ^sdl.Window) -> bool {
 			dx.IDescriptorHeap_UUID,
 			(^rawptr)(&state.rtv_descriptor_heap),
 		)
-		check(hr, "Failed creating descriptor heap")
+		check(hr, "Failed creating descriptor heap") or_return
 	}
 
 	// Fetch rendertargets from swapchain
+	{
+		rtv_descriptor_size: u32 = state.device->GetDescriptorHandleIncrementSize(.RTV)
+		rtv_descriptor_handle: dx.CPU_DESCRIPTOR_HANDLE
+		state.rtv_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&rtv_descriptor_handle)
+		for i: u32 = 0; i < NUM_RENDERTARGETS; i += 1 {
+			hr = state.swapchain->GetBuffer(i, dx.IResource_UUID, (^rawptr)(&state.render_targets[i]))
+			check(hr, "Failed obtaining render target") or_return
+			state.device->CreateRenderTargetView(state.render_targets[i], nil, rtv_descriptor_handle)
+			rtv_descriptor_handle.ptr += uint(rtv_descriptor_size)
+		}
+	}
+
+	// Command allocator
+	hr =
+	state.device->CreateCommandAllocator(
+		.DIRECT,
+		dx.ICommandAllocator_UUID,
+		(^rawptr)(&state.command_allocator),
+	)
+	check(hr, "Failed to create command allocator") or_return
+
+	// Root sig
+	{
+		serialized_desc: ^dx.IBlob
+		{ 	// Create serialized desc
+			desc := dx.VERSIONED_ROOT_SIGNATURE_DESC {
+				Version = ._1_0,
+			}
+			desc.Desc_1_0.Flags = {.ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT}
+			hr = dx.SerializeVersionedRootSignature(&desc, &serialized_desc, nil)
+			check(hr, "Failed to serialized root signature") or_return
+		}
+
+		hr =
+		state.device->CreateRootSignature(
+			0,
+			serialized_desc->GetBufferPointer(),
+			serialized_desc->GetBufferSize(),
+			dx.IRootSignature_UUID,
+			(^rawptr)(&state.root_signature),
+		)
+		check(hr, "Failed creating root signature") or_return
+		serialized_desc->Release()
+	}
+
+	// Pipeline creation
+	{
+		shader_source: cstring = g_shader_source
+		shader_source_size: uint = len(shader_source)
+
+		compile_flags: u32 = 0
+		when ODIN_DEBUG {
+			compile_flags |= u32(d3d_compiler.D3DCOMPILE.DEBUG)
+			compile_flags |= u32(d3d_compiler.D3DCOMPILE.SKIP_OPTIMIZATION)
+		}
+
+		vs: ^dx.IBlob = nil
+		ps: ^dx.IBlob = nil
+
+		hr = d3d_compiler.Compile(
+			rawptr(shader_source),
+			shader_source_size,
+			nil,
+			nil,
+			nil,
+			"VSMain",
+			"vs_4_0",
+			compile_flags,
+			0,
+			&vs,
+			nil,
+		)
+		check(hr, "Failed to compile vertex shader") or_return
+
+		hr = d3d_compiler.Compile(
+			rawptr(shader_source),
+			shader_source_size,
+			nil,
+			nil,
+			nil,
+			"PSMain",
+			"ps_4_0",
+			compile_flags,
+			0,
+			&ps,
+			nil,
+		)
+		check(hr, "Failed to compile pixel shader") or_return
+
+		vertex_format := []dx.INPUT_ELEMENT_DESC {
+			{SemanticName = "POSITION", Format = .R32G32B32A32_FLOAT, InputSlotClass = .PER_VERTEX_DATA},
+			 {
+				SemanticName = "COLOR",
+				Format = .R32G32B32A32_FLOAT,
+				InputSlotClass = .PER_VERTEX_DATA,
+				AlignedByteOffset = size_of(f32) * 3,
+			},
+		}
+
+		blend_state := dx.RENDER_TARGET_BLEND_DESC {
+			BlendEnable           = false,
+			LogicOpEnable         = false,
+			SrcBlend              = .ONE,
+			DestBlend             = .ZERO,
+			BlendOp               = .ADD,
+			SrcBlendAlpha         = .ONE,
+			DestBlendAlpha        = .ZERO,
+			BlendOpAlpha          = .ADD,
+			LogicOp               = .NOOP,
+			RenderTargetWriteMask = u8(dx.COLOR_WRITE_ENABLE_ALL),
+		}
+
+		pipeline_state_desc := dx.GRAPHICS_PIPELINE_STATE_DESC {
+			pRootSignature = state.root_signature,
+			VS = {pShaderBytecode = vs->GetBufferPointer(), BytecodeLength = vs->GetBufferSize()},
+			PS = {pShaderBytecode = ps->GetBufferPointer(), BytecodeLength = ps->GetBufferSize()},
+			StreamOutput = {},
+			BlendState =  {
+				AlphaToCoverageEnable = false,
+				IndependentBlendEnable = false,
+				RenderTarget = {0 = blend_state, 1 ..< 7 = {}},
+			},
+			SampleMask = 0xFFFFFFFF,
+			RasterizerState =  {
+				FillMode = .SOLID,
+				CullMode = .BACK,
+				FrontCounterClockwise = false,
+				DepthBias = 0,
+				DepthBiasClamp = 0,
+				SlopeScaledDepthBias = 0,
+				DepthClipEnable = true,
+				MultisampleEnable = false,
+				AntialiasedLineEnable = false,
+				ForcedSampleCount = 0,
+				ConservativeRaster = .OFF,
+			},
+			DepthStencilState = {DepthEnable = false, StencilEnable = false},
+			InputLayout = {pInputElementDescs = &vertex_format[0], NumElements = u32(len(vertex_format))},
+			PrimitiveTopologyType = .TRIANGLE,
+			NumRenderTargets = 1,
+			RTVFormats = {0 = .R8G8B8A8_UNORM, 1 ..< 7 = .UNKNOWN},
+			DSVFormat = .UNKNOWN,
+			SampleDesc = {Count = 1, Quality = 0},
+		}
+
+		hr =
+		state.device->CreateGraphicsPipelineState(
+			&pipeline_state_desc,
+			dx.IPipelineState_UUID,
+			(^rawptr)(&state.pipeline),
+		)
+		check(hr, "Failed to create pipeline") or_return
+
+		vs->Release()
+		ps->Release()
+
+	} // end of pipeline creation
+
+	// Command list
+	hr =
+	state.device->CreateCommandList(
+		0,
+		.DIRECT,
+		state.command_allocator,
+		state.pipeline,
+		dx.ICommandList_UUID,
+		(^rawptr)(&state.command_list),
+	)
+	check(hr, "Failed to create command list")
+
+	hr = state.command_list->Close()
+	check(hr, "Failed to close command list")
+
+	// Vertex buffer
+	{
+		Vertex :: struct {
+			pos:   [3]f32,
+			color: [4]f32,
+		}
+		vertices := [?]Vertex {
+			{pos = {0.0, 0.5, 0.0}, color = {1, 0, 0, 0}},
+			{pos = {0.5, -0.5, 0.0}, color = {0, 1, 0, 0}},
+			{pos = {-0.5, -0.5, 0.0}, color = {0, 0, 1, 0}},
+		}
+
+		heap_props := dx.HEAP_PROPERTIES {
+			Type = .UPLOAD,
+		}
+		vertex_buffer_size := len(vertices) * size_of(vertices[0])
+
+		resource_desc := dx.RESOURCE_DESC {
+			Dimension = .BUFFER,
+			Alignment = 0,
+			Width = u64(vertex_buffer_size),
+			Height = 1,
+			DepthOrArraySize = 1,
+			MipLevels = 1,
+			Format = .UNKNOWN,
+			SampleDesc = {Count = 1, Quality = 0},
+			Layout = .ROW_MAJOR,
+			Flags = {},
+		}
+
+		hr =
+		state.device->CreateCommittedResource(
+			&heap_props,
+			{},
+			&resource_desc,
+			dx.RESOURCE_STATE_GENERIC_READ,
+			nil,
+			dx.IResource_UUID,
+			(^rawptr)(&state.vertex_buffer),
+		)
+		check(hr, "Failed to create vertex buffer")
+
+		gpu_data: rawptr
+		read_range: dx.RANGE
+		hr = state.vertex_buffer->Map(0, &read_range, &gpu_data)
+		check(hr, "Failed to map gpu memory for vertex buffer")
+		mem.copy(gpu_data, &vertices[0], vertex_buffer_size)
+		state.vertex_buffer->Unmap(0, nil)
+
+		state.vertex_buffer_view = dx.VERTEX_BUFFER_VIEW {
+			BufferLocation = state.vertex_buffer->GetGPUVirtualAddress(),
+			StrideInBytes  = u32(size_of(Vertex)),
+			SizeInBytes    = u32(vertex_buffer_size),
+		}
+
+	}
+
+	// Frame finished fence
+	{
+		hr = state.device->CreateFence(state.frame_finished_fence_value, {}, dx.IFence_UUID, (^rawptr)(&state.frame_finished_fence))
+		check(hr, "Failed to create frame finished fence")
+		state.frame_finished_fence_value += 1
+		fence_event := win32.CreateEventW(nil, false, false, nil)
+		if fence_event == nil {
+			log.fatal("Failed to create fence event")
+			return false
+		}
+	}
 
 	return true
 }
@@ -134,8 +387,9 @@ deinit :: proc() {
 	free(state)
 }
 
-update :: proc(window: ^sdl.Window) {
+update :: proc(window: ^sdl.Window) -> bool {
 	// log.info("Updating")
+	return true
 }
 
 check :: proc(res: dx.HRESULT, message: string) -> bool {
@@ -155,4 +409,23 @@ client_size_from_window :: proc(window: ^sdl.Window) -> [2]i32 {
 	sdl.GetWindowSize(window, &res[0], &res[1])
 	return res
 }
+
+// Shader source code
+g_shader_source: cstring : `
+struct PSInput {
+	float4 position: SV_POSITION;
+	float4 color: COLOR;
+};
+
+PSInput VSMain(float4 position: POSITION0, float4 color: COLOR0) {
+	PSInput result;
+	result.position = position;
+	result.color = color;
+	return result;
+}
+
+float4 PSMain(PSInput input) : SV_TARGET {
+	return input.color;
+};
+`
 
