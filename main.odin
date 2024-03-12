@@ -1,13 +1,14 @@
 package main
 
 import "core:log"
+import dxgi "vendor:directx/dxgi"
 import sdl "vendor:sdl2"
 
 import "triangle"
 
 main :: proc() {
 	context.logger = log.create_console_logger()
-	
+
 	if err := sdl.Init({.VIDEO}); err != 0 {
 		log.fatal("Failed to create window")
 		return
@@ -37,13 +38,12 @@ main :: proc() {
 	main_loop: for {
 		for event: sdl.Event; sdl.PollEvent(&event); {
 			#partial switch event.type {
-				case .QUIT:
-					break main_loop
-			}	
+			case .QUIT:
+				break main_loop
+			}
 
 			triangle.update(window)
 		}
 	}
 
 }
-
