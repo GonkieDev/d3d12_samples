@@ -1,14 +1,18 @@
 package triangle
 
 // Credits to: https://gist.github.com/jakubtomsu/ecd83e61976d974c7730f9d7ad3e1fd0
+// This file is based on ^
+
+// Renders simple triangle
+// NOTE(gsp): window resizing not implemented
 
 import "core:log"
 import "core:mem"
+import win32 "core:sys/windows"
 import dx "vendor:directx/d3d12"
 import d3d_compiler "vendor:directx/d3d_compiler"
 import dxgi "vendor:directx/dxgi"
 import sdl "vendor:sdl2"
-import win32 "core:sys/windows"
 
 @(private)
 NUM_RENDERTARGETS :: 2
@@ -31,6 +35,7 @@ State :: struct {
 	vertex_buffer_view:         dx.VERTEX_BUFFER_VIEW,
 	frame_finished_fence:       ^dx.IFence,
 	frame_finished_fence_value: u64,
+	frame_finished_fence_event: win32.HANDLE,
 }
 
 @(private)
@@ -227,8 +232,8 @@ init :: proc(window: ^sdl.Window) -> bool {
 		check(hr, "Failed to compile pixel shader") or_return
 
 		vertex_format := []dx.INPUT_ELEMENT_DESC {
-			{SemanticName = "POSITION", Format = .R32G32B32A32_FLOAT, InputSlotClass = .PER_VERTEX_DATA},
-			 {
+			{SemanticName = "POSITION", Format = .R32G32B32_FLOAT, InputSlotClass = .PER_VERTEX_DATA},
+		 {
 				SemanticName = "COLOR",
 				Format = .R32G32B32A32_FLOAT,
 				InputSlotClass = .PER_VERTEX_DATA,
@@ -317,9 +322,9 @@ init :: proc(window: ^sdl.Window) -> bool {
 			color: [4]f32,
 		}
 		vertices := [?]Vertex {
-			{pos = {0.0, 0.5, 0.0}, color = {1, 0, 0, 0}},
-			{pos = {0.5, -0.5, 0.0}, color = {0, 1, 0, 0}},
-			{pos = {-0.5, -0.5, 0.0}, color = {0, 0, 1, 0}},
+			{pos = {0.0, 0.5, 0.0}, color = {1, 0, 0, 1}},
+			{pos = {0.5, -0.5, 0.0}, color = {0, 1, 0, 1}},
+			{pos = {-0.5, -0.5, 0.0}, color = {0, 0, 1, 1}},
 		}
 
 		heap_props := dx.HEAP_PROPERTIES {
@@ -369,11 +374,17 @@ init :: proc(window: ^sdl.Window) -> bool {
 
 	// Frame finished fence
 	{
-		hr = state.device->CreateFence(state.frame_finished_fence_value, {}, dx.IFence_UUID, (^rawptr)(&state.frame_finished_fence))
+		hr =
+		state.device->CreateFence(
+			state.frame_finished_fence_value,
+			{},
+			dx.IFence_UUID,
+			(^rawptr)(&state.frame_finished_fence),
+		)
 		check(hr, "Failed to create frame finished fence")
 		state.frame_finished_fence_value += 1
-		fence_event := win32.CreateEventW(nil, false, false, nil)
-		if fence_event == nil {
+		state.frame_finished_fence_event = win32.CreateEventW(nil, false, false, nil)
+		if state.frame_finished_fence_event == nil {
 			log.fatal("Failed to create fence event")
 			return false
 		}
@@ -389,6 +400,101 @@ deinit :: proc() {
 
 update :: proc(window: ^sdl.Window) -> bool {
 	// log.info("Updating")
+
+	using state
+
+	hr: dx.HRESULT
+
+	hr = command_allocator->Reset()
+	check(hr, "Failed resetting command allocator") or_return
+
+	hr = command_list->Reset(command_allocator, pipeline)
+	check(hr, "Failed to reset command list") or_return
+
+	width, height := expand_values(client_size_from_window(window))
+	viewport := dx.VIEWPORT {
+		Width  = f32(width),
+		Height = f32(height),
+	}
+	scissor_rect := dx.RECT {
+		right  = width,
+		bottom = height,
+	}
+
+	command_list->SetGraphicsRootSignature(root_signature)
+	command_list->RSSetViewports(1, &viewport)
+	command_list->RSSetScissorRects(1, &scissor_rect)
+
+	to_render_target_barrier := dx.RESOURCE_BARRIER {
+		Type = .TRANSITION,
+		Flags = {},
+		Transition =  {
+			pResource = render_targets[frame_index],
+			StateBefore = dx.RESOURCE_STATE_PRESENT,
+			StateAfter = {.RENDER_TARGET},
+			Subresource = dx.RESOURCE_BARRIER_ALL_SUBRESOURCES,
+		},
+	}
+	command_list->ResourceBarrier(1, &to_render_target_barrier)
+
+	// TODO(gsp): make this look more like d3d12 cpp triangle sample
+	rtv_handle: dx.CPU_DESCRIPTOR_HANDLE
+	rtv_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&rtv_handle)
+	if (frame_index > 0) {
+		size := device->GetDescriptorHandleIncrementSize(.RTV)
+		rtv_handle.ptr += uint(frame_index * size)
+	}
+
+	command_list->OMSetRenderTargets(1, &rtv_handle, false, nil)
+
+	// Record commands
+
+	// Clear
+	clear_color: [4]f32 = {0.3, 0.3, 0.3, 1.0}
+	command_list->ClearRenderTargetView(rtv_handle, &clear_color, 0, nil)
+
+	// Draw
+	command_list->IASetPrimitiveTopology(.TRIANGLELIST)
+	command_list->IASetVertexBuffers(0, 1, &vertex_buffer_view)
+	command_list->DrawInstanced(3, 1, 0, 0)
+
+	// Indicate that backbuffer will not be used to present
+	to_present_barrier := to_render_target_barrier
+	to_present_barrier.Transition.StateBefore = {.RENDER_TARGET}
+	to_present_barrier.Transition.StateAfter = dx.RESOURCE_STATE_PRESENT
+	command_list->ResourceBarrier(1, &to_present_barrier)
+
+	hr = command_list->Close()
+	check(hr, "Failed to close command list") or_return
+
+	// Execute command list
+	{
+		command_lists := [?]^dx.IGraphicsCommandList{command_list}
+		queue->ExecuteCommandLists(len(command_lists), (^^dx.ICommandList)(&command_lists[0]))
+	}
+
+	// Present
+	hr = swapchain->Present1(1, {}, &{})
+	check(hr, "Failed to present") or_return
+
+	// Wait for frame to finish
+	{
+		current_fence_value := frame_finished_fence_value
+		hr = queue->Signal(frame_finished_fence, current_fence_value)
+		check(hr, "Failed to signal fence")
+
+		frame_finished_fence_value += 1
+		completed := frame_finished_fence->GetCompletedValue()
+
+		if completed < current_fence_value {
+			hr = frame_finished_fence->SetEventOnCompletion(current_fence_value, frame_finished_fence_event)
+			check(hr, "Failed to set event on completion flag")
+			win32.WaitForSingleObject(frame_finished_fence_event, win32.INFINITE)
+		}
+
+		frame_index = swapchain->GetCurrentBackBufferIndex()
+	}
+
 	return true
 }
 

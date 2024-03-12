@@ -16,8 +16,8 @@ main :: proc() {
 	defer sdl.Quit()
 
 	window_title := "D3D12 Samples" + " (DEBUG)" when ODIN_DEBUG else ""
-	window_width := i32(640)
-	window_height := i32(640)
+	window_width := i32(720)
+	window_height := i32(480)
 	window := sdl.CreateWindow(
 		"D3D12 Samples",
 		sdl.WINDOWPOS_UNDEFINED,
@@ -39,7 +39,7 @@ main :: proc() {
 		for event: sdl.Event; sdl.PollEvent(&event); {
 			#partial switch event.type {
 			case .QUIT:
-				break main_loop
+				break main_loop				
 			}
 
 			triangle.update(window)
