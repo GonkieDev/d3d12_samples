@@ -407,6 +407,8 @@ deinit :: proc() {
 	wait_for_previous_frame()
 	win32.CloseHandle(frame_finished_fence_event)
 
+	factory->Release()
+	
 	utils.unregister_debug_message_callback(device, msg_callback_cookie)
 
 	free(state)
