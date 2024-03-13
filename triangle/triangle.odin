@@ -14,6 +14,9 @@ import d3d_compiler "vendor:directx/d3d_compiler"
 import dxgi "vendor:directx/dxgi"
 import sdl "vendor:sdl2"
 
+import utils "../utils"
+check :: utils.check
+
 @(private)
 NUM_RENDERTARGETS :: 2
 
@@ -22,6 +25,7 @@ State :: struct {
 	factory:                    ^dxgi.IFactory4,
 	adapter:                    ^dxgi.IAdapter1,
 	device:                     ^dx.IDevice,
+	msg_callback_cookie:        u32,
 	queue:                      ^dx.ICommandQueue,
 	swapchain:                  ^dxgi.ISwapChain3,
 	rtv_descriptor_heap:        ^dx.IDescriptorHeap,
@@ -42,6 +46,7 @@ State :: struct {
 state: ^State
 
 init :: proc(window: ^sdl.Window) -> bool {
+
 	log.info("Triangle init")
 	state = new(State)
 
@@ -49,9 +54,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 
 	// Init debug controller
 	when ODIN_DEBUG {
-		hr = dx.GetDebugInterface(dx.IDebug_UUID, (^rawptr)(&state.debug_ctrl))
-		check(hr, "Failed to create debug controller") or_return
-		state.debug_ctrl->EnableDebugLayer()
+		state.debug_ctrl = utils.enable_debug_layer({}) or_return
 		log.debug("D3D12 debug layer enabled")
 	}
 
@@ -87,6 +90,9 @@ init :: proc(window: ^sdl.Window) -> bool {
 	)
 	check(hr, "Failed to create device") or_return
 
+	// Register callback message fn
+	state.msg_callback_cookie = utils.register_debug_message_callback(state.device, utils.default_message_callback) or_return
+
 	// Create command queue
 	hr =
 	state.device->CreateCommandQueue(
@@ -98,7 +104,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 
 	// Swapchain creation
 	{
-		width, height := expand_values(client_size_from_window(window))
+		width, height := expand_values(utils.client_size_from_window(window))
 		desc := dxgi.SWAP_CHAIN_DESC1 {
 			Width = u32(width),
 			Height = u32(height),
@@ -113,7 +119,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 		hr =
 		state.factory->CreateSwapChainForHwnd(
 			(^dxgi.IUnknown)(state.queue),
-			hwnd_from_window(window),
+			utils.hwnd_from_window(window),
 			&desc,
 			nil,
 			nil,
@@ -233,7 +239,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 
 		vertex_format := []dx.INPUT_ELEMENT_DESC {
 			{SemanticName = "POSITION", Format = .R32G32B32_FLOAT, InputSlotClass = .PER_VERTEX_DATA},
-		 {
+			 {
 				SemanticName = "COLOR",
 				Format = .R32G32B32A32_FLOAT,
 				InputSlotClass = .PER_VERTEX_DATA,
@@ -395,15 +401,14 @@ init :: proc(window: ^sdl.Window) -> bool {
 
 deinit :: proc() {
 	log.info("Triangle deinit")
-	
-	using state
 
+	using state
 
 	wait_for_previous_frame()
 	win32.CloseHandle(frame_finished_fence_event)
-	
-	// TODO(gsp): finish this func
-	
+
+	utils.unregister_debug_message_callback(device, msg_callback_cookie)
+
 	free(state)
 }
 
@@ -420,7 +425,7 @@ update :: proc(window: ^sdl.Window) -> bool {
 	hr = command_list->Reset(command_allocator, pipeline)
 	check(hr, "Failed to reset command list") or_return
 
-	width, height := expand_values(client_size_from_window(window))
+	width, height := expand_values(utils.client_size_from_window(window))
 	viewport := dx.VIEWPORT {
 		Width  = f32(width),
 		Height = f32(height),
@@ -497,7 +502,7 @@ wait_for_previous_frame :: proc() -> bool {
 	using state
 
 	hr: dx.HRESULT
-	
+
 	current_fence_value := frame_finished_fence_value
 	hr = queue->Signal(frame_finished_fence, current_fence_value)
 	check(hr, "Failed to signal fence") or_return
@@ -534,22 +539,3 @@ float4 PSMain(PSInput input) : SV_TARGET {
 };
 `
 
-// Util check
-check :: proc(res: dx.HRESULT, message: string) -> bool {
-	if (res >= 0) do return true
-	log.errorf("%v. Error code: %0x\n", message, u32(res))
-	return false
-}
-
-// Window stuff
-hwnd_from_window :: proc(window: ^sdl.Window) -> dxgi.HWND {
-	wm_info: sdl.SysWMinfo
-	sdl.GetWindowWMInfo(window, &wm_info)
-	return dxgi.HWND(wm_info.info.win.window)
-}
-
-client_size_from_window :: proc(window: ^sdl.Window) -> [2]i32 {
-	res: [2]i32
-	sdl.GetWindowSize(window, &res[0], &res[1])
-	return res
-}
