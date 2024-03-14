@@ -3,3 +3,4 @@
 *.pdb
 ols.json
 odinfmt.json
+*.raddbg

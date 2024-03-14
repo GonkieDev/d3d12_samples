@@ -1,18 +1,14 @@
 package main
 
-// Building: add SDL2.dll to wherever you put the final exe
-
 import "core:log"
 import dxgi "vendor:directx/dxgi"
 import sdl "vendor:sdl2"
-
-import "triangle"
 
 main :: proc() {
 	context.logger = log.create_console_logger()
 
 	if err := sdl.Init({.VIDEO}); err != 0 {
-		log.fatal("Failed to create window")
+		log.fatal("Failed to init SDL")
 		return
 	}
 	defer sdl.Quit()
@@ -34,8 +30,7 @@ main :: proc() {
 	}
 	defer sdl.DestroyWindow(window)
 
-	if !triangle.init(window) do return
-	defer triangle.deinit()
+	if !r_init(window) do return
 
 	main_loop: for {
 		for event: sdl.Event; sdl.PollEvent(&event); {
@@ -44,7 +39,7 @@ main :: proc() {
 				break main_loop				
 			}
 
-			triangle.update(window)
+			r_update(window)
 		}
 	}
 

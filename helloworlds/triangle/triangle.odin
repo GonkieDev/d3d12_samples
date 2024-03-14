@@ -1,4 +1,4 @@
-package triangle
+package main
 
 // Credits to: https://gist.github.com/jakubtomsu/ecd83e61976d974c7730f9d7ad3e1fd0
 // This file is based on ^
@@ -45,7 +45,7 @@ State :: struct {
 @(private)
 state: ^State
 
-init :: proc(window: ^sdl.Window) -> bool {
+r_init :: proc(window: ^sdl.Window) -> bool {
 
 	log.info("Triangle init")
 	state = new(State)
@@ -91,7 +91,9 @@ init :: proc(window: ^sdl.Window) -> bool {
 	check(hr, "Failed to create device") or_return
 
 	// Register callback message fn
-	state.msg_callback_cookie = utils.register_debug_message_callback(state.device, utils.default_message_callback) or_return
+	when ODIN_DEBUG {
+		state.msg_callback_cookie = utils.register_debug_message_callback(state.device, utils.default_message_callback) or_return
+	}
 
 	// Create command queue
 	hr =
@@ -399,22 +401,7 @@ init :: proc(window: ^sdl.Window) -> bool {
 	return true
 }
 
-deinit :: proc() {
-	log.info("Triangle deinit")
-
-	using state
-
-	wait_for_previous_frame()
-	win32.CloseHandle(frame_finished_fence_event)
-
-	factory->Release()
-	
-	utils.unregister_debug_message_callback(device, msg_callback_cookie)
-
-	free(state)
-}
-
-update :: proc(window: ^sdl.Window) -> bool {
+r_update :: proc(window: ^sdl.Window) -> bool {
 	// log.info("Updating")
 
 	using state
